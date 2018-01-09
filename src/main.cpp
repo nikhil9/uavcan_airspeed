@@ -12,6 +12,7 @@
 #include <uavcan/protocol/dynamic_node_id_client.hpp>
 #include <uavcan/protocol/logger.hpp>
 #include <uavcan/equipment/air_data/RawAirData.hpp>
+#include <uavcan/equipment/ahrs/MagneticFieldStrength.hpp>
 #include <math.h>
 /*
  * GCC 4.9 cannot generate a working binary with higher optimization levels, although
@@ -26,6 +27,33 @@
 #define DEFAULT_I2C          I2C0
 I2C_ID_T i2cDev = DEFAULT_I2C;  /* Currently active I2C device */
 
+#define COMPASS_ADDRESS      0x1E
+#define ConfigRegA           0x00
+#define ConfigRegB           0x01
+#define magGain              0x20
+#define PositiveBiasConfig   0x11
+#define NegativeBiasConfig   0x12
+#define NormalOperation      0x10
+#define ModeRegister         0x02
+#define ContinuousConversion 0x00
+#define SingleConversion     0x01
+
+// ConfigRegA valid sample averaging for 5883L
+#define SampleAveraging_1    0x00
+#define SampleAveraging_2    0x01
+#define SampleAveraging_4    0x02
+#define SampleAveraging_8    0x03
+
+// ConfigRegA valid data output rates for 5883L
+#define DataOutputRate_0_75HZ 0x00
+#define DataOutputRate_1_5HZ  0x01
+#define DataOutputRate_3HZ    0x02
+#define DataOutputRate_7_5HZ  0x03
+#define DataOutputRate_15HZ   0x04
+#define DataOutputRate_30HZ   0x05
+#define DataOutputRate_75HZ   0x06
+
+
 /**
  * This function re-defines the standard ::rand(), which is used by the class uavcan::DynamicNodeIDClient.
  * Redefinition is normally not needed, but GCC 4.9 tends to generate broken binaries if it is not redefined.
@@ -37,7 +65,7 @@ int rand()
     return x;
 }
 
-
+float field[3];
 
 namespace
 {
@@ -144,6 +172,46 @@ void init()
 
     board::resetWatchdog();
 }
+
+void register_write(uint8_t reg, uint8_t val){
+
+	uint8_t addr = COMPASS_ADDRESS;
+ 	uint8_t txbuf[2];
+ 	txbuf[0] = reg;
+ 	txbuf[1] = val;
+ 	Chip_I2C_MasterSend(i2cDev, addr, txbuf, sizeof(txbuf));
+}
+
+
+const float GaussScale = 0.92e-03;
+void get_mag_data(void){
+
+	field[0] = (float)0;
+	field[1] = (float)0;
+	field[2] = (float)521;
+
+
+	uint8_t addr = COMPASS_ADDRESS;
+	uint8_t txbuf[2];
+	txbuf[0] = ModeRegister;
+	txbuf[1] = SingleConversion;
+	Chip_I2C_MasterSend(i2cDev, addr, txbuf, sizeof(txbuf));
+
+	txbuf[0] = 0x03;
+	uint8_t buff[6];
+
+	Chip_I2C_MasterCmdRead(i2cDev, addr, 0x03, buff, sizeof(buff));
+
+	int16_t rx, ry, rz;
+	rx = (((int16_t)buff[0]) << 8) | buff[1];
+	rz = (((int16_t)buff[2]) << 8) | buff[3];
+	ry = (((int16_t)buff[4]) << 8) | buff[5];
+
+	field[0] = rx*GaussScale;
+	field[1] = ry*GaussScale;
+	field[2] = rz*GaussScale;
+}
+
 }
 
 
@@ -153,60 +221,26 @@ int main()
     getNode().setModeOperational();
 
     uavcan::MonotonicTime prev_log_at;
-    uavcan::Publisher<uavcan::equipment::air_data::RawAirData>          _uavcan_pub_raw_aspd(getNode());
-    //start I2C read
-    uint8_t cmd = 0;
-    _uavcan_pub_raw_aspd.setPriority(6);
-    Chip_I2C_MasterSend(i2cDev,0x28,&cmd,1);
+    uavcan::Publisher<uavcan::equipment::ahrs::MagneticFieldStrength>_uavcan_pub_raw_mag(getNode());
+
+    _uavcan_pub_raw_mag.setPriority(6);
+
+	uint8_t addr = COMPASS_ADDRESS;
+	uint8_t txbuf[2];
+	txbuf[0] = ConfigRegA;
+	txbuf[1] = SampleAveraging_8<<5 | DataOutputRate_75HZ<<2 | NormalOperation;
+
+	Chip_I2C_MasterSend(i2cDev, addr, txbuf, sizeof(txbuf));
 
     while (true)
     {
         getNode().spin(uavcan::MonotonicDuration::fromMSec(10));
 
-        uint8_t dat[4] = {0};
+        get_mag_data();
 
-
-        /* Setup I2C parameters to send 4 bytes of data */
-
-        Chip_I2C_MasterRead(i2cDev, 0x28, dat, 4);
-
-        Chip_I2C_MasterSend(i2cDev, 0x28,&cmd,1);
-
-        uint8_t status = (dat[0] & 0xC0) >> 6;
-        if (status == 2 || status == 3) {
-            continue;
-        }
-
-        int16_t dp_raw, dT_raw;
-        dp_raw = int16_t((uint16_t(dat[0]) << 8) + uint16_t(dat[1]));
-        dp_raw = 0x3FFF & dp_raw;
-        dT_raw = int16_t((uint16_t(dat[2]) << 8) + uint16_t(dat[3]));
-        dT_raw = int16_t((0xFFE0 & dT_raw) >> 5);
-
-        const float P_max = 1.0f;
-        const float P_min = - P_max;
-        const float PSI_to_Pa = 6894.757f;
-        /*
-          this equation is an inversion of the equation in the
-          pressure transfer function figure on page 4 of the datasheet
-          We negate the result so that positive differential pressures
-          are generated when the bottom port is used as the static
-          port on the pitot and top port is used as the dynamic port
-         */
-        float diff_press_PSI = -((float(dp_raw) - 0.1f*16383.0f) * (P_max-P_min)/(0.8f*16383.0f) + P_min);
-
-        float press = diff_press_PSI * PSI_to_Pa;
-        float temp = ((200.0f * dT_raw) / 2047) - 50 + 273.15f;
-        //float raw_airspeed = sqrtf(press * 2.0f);
-        /*
-         * CAN error counter, for debugging purposes
-         */
-
-
-        uavcan::equipment::air_data::RawAirData raw_aspd_msg;
-        raw_aspd_msg.static_air_temperature = temp;
-        raw_aspd_msg.differential_pressure = press;
-        (void)_uavcan_pub_raw_aspd.broadcast(raw_aspd_msg);
+        uavcan::equipment::ahrs::MagneticFieldStrength mag;
+        std::copy(field, field + 3, mag.magnetic_field_ga.begin());
+        (void)_uavcan_pub_raw_mag.broadcast(mag);
 
         board::resetWatchdog();
     }
